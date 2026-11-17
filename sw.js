@@ -1,97 +1,133 @@
-/* Eleven×11 Service Worker
-   策略：页面走网络优先（保证打开就是最新版），静态资源走缓存优先
-   更新代码后如果想让缓存彻底刷新，把下面的版本号 +1 即可
-*/
-const CACHE = 'eleven11-v4';
-const CORE = [
-  './',
-  './index.html',
-  './manifest.json',
-  './icon-180.png',
-  './icon-192.png',
-  './icon-512.png'
-];
+/* Eleven×11 Service Worker —— 在线永远取最新版，缓存只做断网兜底
+ *
+ * 关键点：
+ * 1) 打开页面（navigate）走网络，并加 __sw 时间戳绕过 CDN/浏览器旧缓存；
+ * 2) 只有网络失败（断网）才返回上一次成功缓存的 index.html；
+ * 3) 其它同源静态文件也是网络优先，失败才用缓存；
+ * 4) 新 sw 立刻 skipWaiting + clients.claim，并清掉旧 eleven11 缓存。
+ *
+ * 换版本不需要改这个文件；但如果你改了这个文件本身，浏览器会重新安装。
+ */
+const CACHE = "eleven11-runtime-v2";
+const INDEX_URL = new URL("./index.html", self.location.href).href;
+const SHELL = [
+  "./manifest.json",
+  "./icon-192.png",
+  "./icon-512.png",
+  "./icon-maskable-512.png",
+].map((p) => new URL(p, self.location.href).href);
 
-/* 安装：逐个缓存，任何一个失败都不影响其它 */
-self.addEventListener('install', function (e) {
-  e.waitUntil(
-    caches.open(CACHE).then(function (c) {
-      return Promise.all(
-        CORE.map(function (u) {
-          return c.add(u).catch(function () { });
-        })
-      );
-    }).then(function () {
-      return self.skipWaiting();
-    })
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches
+      .open(CACHE)
+      .then((cache) => cache.addAll(SHELL).catch(() => {}))
+      .then(() => self.skipWaiting())
   );
 });
 
-/* 激活：清掉旧版本缓存，立刻接管 */
-self.addEventListener('activate', function (e) {
-  e.waitUntil(
-    caches.keys().then(function (keys) {
-      return Promise.all(
-        keys.map(function (k) {
-          return k === CACHE ? null : caches.delete(k);
-        })
-      );
-    }).then(function () {
-      return self.clients.claim();
-    })
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches
+      .keys()
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((k) => k.indexOf("eleven11") === 0 && k !== CACHE)
+            .map((k) => caches.delete(k))
+        )
+      )
+      .then(() => self.clients.claim())
   );
 });
 
-/* 请求拦截 */
-self.addEventListener('fetch', function (e) {
-  const req = e.request;
-  if (req.method !== 'GET') return;
+self.addEventListener("message", (event) => {
+  if (event.data && event.data.type === "SKIP_WAITING") self.skipWaiting();
+});
 
-  /* ① 页面导航：网络优先，3 秒拿不到就用缓存 */
-  if (req.mode === 'navigate') {
-    e.respondWith(
-      (function () {
-        const cacheFallback = caches.match('./index.html');
-        const net = fetch(req, { cache: 'no-cache' }).then(function (r) {
-          if (r && r.ok) {
-            const cp = r.clone();
-            caches.open(CACHE).then(function (c) {
-              c.put('./index.html', cp).catch(function () { });
-            });
-          }
-          return r;
-        });
-        const timeout = new Promise(function (_, reject) {
-          setTimeout(reject, 3000);
-        });
-        return Promise.race([net, timeout]).catch(function () {
-          return cacheFallback.then(function (c) {
-            return c || net;
-          });
-        });
-      })()
-    );
+function freshUrl(raw) {
+  const u = new URL(raw);
+  u.searchParams.set("__sw", Date.now().toString(36));
+  return u.href;
+}
+
+async function networkFirstIndex(request) {
+  try {
+    const res = await fetch(freshUrl(request.url), {
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "follow",
+    });
+    if (res && res.ok && res.status === 200 && !res.redirected) {
+      const copy = res.clone();
+      caches
+        .open(CACHE)
+        .then((cache) => cache.put(INDEX_URL, copy))
+        .catch(() => {});
+    }
+    return res;
+  } catch (err) {
+    const hit = await caches.match(INDEX_URL, { ignoreSearch: true });
+    if (hit) return hit;
+    return new Response("当前离线，请联网后重新打开。", {
+      status: 503,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+}
+
+async function networkFirstAsset(request) {
+  try {
+    const res = await fetch(request, { cache: "no-store", credentials: "same-origin" });
+    if (res && res.ok && res.status === 200) {
+      const copy = res.clone();
+      caches
+        .open(CACHE)
+        .then((cache) => cache.put(request, copy))
+        .catch(() => {});
+    }
+    return res;
+  } catch (err) {
+    const hit = await caches.match(request, { ignoreSearch: true });
+    if (hit) return hit;
+    throw err;
+  }
+}
+
+self.addEventListener("fetch", (event) => {
+  const req = event.request;
+  if (req.method !== "GET") return;
+
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return; // 音乐、外链图片不拦
+  if (url.pathname.endsWith("/sw.js")) return; // sw 自己不要被 sw 接管
+
+  if (req.mode === "navigate") {
+    event.respondWith(networkFirstIndex(req));
     return;
   }
 
-  /* ② 其它静态资源：缓存优先，后台静默更新 */
-  e.respondWith(
-    caches.match(req).then(function (cached) {
-      const net = fetch(req).then(function (r) {
-        const cp = r.clone();
-        caches.open(CACHE).then(function (c) {
-          c.put(req, cp).catch(function () { });
-        });
-        return r;
-      }).catch(function () {
-        return null;
-      });
-      return cached || net;
-    })
-  );
+  event.respondWith(networkFirstAsset(req));
 });
 
-/* 允许页面主动要求「跳过等待」立即生效 */
-self.addEventListener('message', function (e) {
-  if (e.data === 'SKIP_WAITING') self.skipWaiting();
+/* 点系统通知 → 回到 App 的聊天页 */
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const data = (event.notification && event.notification.data) || {};
+  if (!data.elevenChat) return;
+  event.waitUntil(
+    self.clients
+      .matchAll({ type: "window", includeUncontrolled: true })
+      .then((list) => {
+        for (const c of list) {
+          if ("focus" in c) {
+            try {
+              c.postMessage({ type: "eleven-open-chat" });
+            } catch (err) {}
+            return c.focus();
+          }
+        }
+        if (self.clients.openWindow) return self.clients.openWindow("./index.html#chat");
+      })
+  );
 });
